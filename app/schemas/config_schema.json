@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Billing Config",
+  "type": "object",
+  "required": ["label", "payment", "plans"],
+  "properties": {
+    "label": { "type": "string", "minLength": 1 },
+    "payment": {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "type": "string", "enum": ["checkout", "direct"] }
+      },
+      "additionalProperties": false
+    },
+    "plans": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["name", "billing", "strategies"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "billing": {
+            "type": "object",
+            "required": ["priceId", "cadence", "currency"],
+            "properties": {
+              "priceId": { "type": "string", "minLength": 1 },
+              "cadence": { "type": "string", "enum": ["month", "year"] },
+              "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
+            },
+            "additionalProperties": false
+          },
+          "trialDays": { "type": "integer", "minimum": 0, "default": 0 },
+          "strategies": {
+            "type": "object",
+            "required": [
+              "ProrationStrategy",
+              "InvoicingStrategy",
+              "EntitlementStrategy",
+              "MeteringStrategy",
+              "SeatStrategy"
+            ],
+            "properties": {
+              "ProrationStrategy": { "type": "string" },
+              "InvoicingStrategy": { "type": "string" },
+              "EntitlementStrategy": { "type": "string" },
+              "MeteringStrategy": { "type": "string" },
+              "SeatStrategy": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "features": {
+            "type": "object",
+            "properties": {
+              "seats": { "type": "integer", "minimum": 0 },
+              "limits": {
+                "type": "object",
+                "additionalProperties": { "type": "number", "minimum": 0 }
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

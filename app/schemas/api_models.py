@@ -1,0 +1,97 @@
+from __future__ import annotations
+from typing import Optional, Dict, Any
+from uuid import UUID
+from pydantic import BaseModel, Field, conint
+
+# ---------- Subscriptions ----------
+
+class CreateSubscriptionRequest(BaseModel):
+    accountId: str = Field(..., min_length=1)
+    planCode: str = Field(..., min_length=1)
+    quantity: int = Field(1, ge=1)
+    checkout: bool = True                     # if True -> hosted Checkout; else direct
+    coupon: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None # arbitrary key/values to round-trip to Stripe
+
+class SubscriptionResponse(BaseModel):
+    id: UUID
+    projectId: str
+    accountId: str
+    planCode: str
+    quantity: int
+    status: str
+    configVersionId: UUID
+    stripeCustomerId: Optional[str] = None
+    stripeSubscriptionId: Optional[str] = None
+    currentPeriodStart: Optional[str] = None  # ISO8601 or None
+    currentPeriodEnd: Optional[str] = None    # ISO8601 or None
+    cancelAtPeriodEnd: bool = False
+    checkoutUrl: Optional[str] = None         # set in checkout flow
+    metadata: Optional[Dict[str, Any]] = None # <-- add this
+
+# ---------- Mutations we’ll use soon ----------
+
+class ChangePlanRequest(BaseModel):
+    planCode: str = Field(..., min_length=1)
+    quantity: conint(ge=1) = 1
+    # Stripe options: "create_prorations" | "none" | "always_invoice"
+    prorationBehavior: str = Field(default="create_prorations")
+
+class CancelRequest(BaseModel):
+    cancelAtPeriodEnd: bool = True
+
+class ResumeRequest(BaseModel):
+    # no fields for now; present for symmetry / future options
+    pass
+
+# ---------- Usage ----------
+
+class UsageEventRequest(BaseModel):
+    accountId: str = Field(..., min_length=1)
+    metricKey: str = Field(..., min_length=1)
+    quantity: float = Field(..., gt=0)
+    sourceId: Optional[str] = None
+    occurredAt: Optional[str] = None         # ISO8601; defaults to now() if missing
+    metadata: Optional[Dict[str, Any]] = None
+
+class UsageEventResponse(BaseModel):
+    id: UUID
+    projectId: str
+    accountId: str
+    metricKey: str
+    quantity: float
+    occurredAt: str
+    sourceId: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+class UsageSummaryItem(BaseModel):
+    metricKey: str
+    total: float
+
+class UsageSummaryResponse(BaseModel):
+    projectId: str
+    accountId: str
+    windowStart: str
+    windowEnd: str
+    items: list[UsageSummaryItem]
+
+# ---------- Invoices ----------
+
+class InvoiceListItem(BaseModel):
+    id: UUID
+    projectId: str
+    stripeInvoiceId: str
+    stripeCustomerId: Optional[str] = None
+    stripeSubscriptionId: Optional[str] = None
+    status: str
+    currency: Optional[str] = None
+    subtotal: Optional[float] = None
+    total: Optional[float] = None
+    hostedInvoiceUrl: Optional[str] = None
+    periodStart: Optional[str] = None
+    periodEnd: Optional[str] = None
+    createdAt: Optional[str] = None
+
+class InvoiceDetail(InvoiceListItem):
+    # If later you mirror line items, add them here
+    pass
