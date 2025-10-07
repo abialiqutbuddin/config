@@ -1,21 +1,50 @@
+# app/api/stripe_webhooks.py
 from __future__ import annotations
-from typing import Optional
+
+from typing import Optional, Any, Dict
 from datetime import datetime, timezone
 
-import stripe
 from fastapi import APIRouter, Request, Header, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db, get_stripe_provider
 from app.persistence.repo import EventRepo, SubscriptionRepo, InvoiceRepo
-from app.engine.engine import EngineError
 
 router = APIRouter(prefix="/stripe", tags=["Stripe"])
 
-def _utc(dt: Optional[int]) -> Optional[datetime]:
-    if dt is None:
+
+# -------------------- helpers --------------------
+
+def _utc_from_epoch(ts: Optional[int]) -> Optional[datetime]:
+    if ts is None:
         return None
-    return datetime.fromtimestamp(int(dt), tz=timezone.utc)
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+
+
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    """
+    Normalize Stripe SDK objects (have .to_dict_recursive()) and plain dicts to a plain dict.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    # Stripe.py resources expose to_dict_recursive()
+    to_dict = getattr(obj, "to_dict_recursive", None)
+    if callable(to_dict):
+        return to_dict()
+    # Fallback best-effort
+    return dict(obj)
+
+
+def _require(md: Dict[str, Any], key: str) -> Optional[str]:
+    v = None
+    if isinstance(md, dict):
+        v = md.get(key)
+    return v
+
+
+# -------------------- webhook --------------------
 
 @router.post("/webhook")
 async def webhook(
@@ -26,125 +55,141 @@ async def webhook(
 ):
     """
     Handles key events and syncs local DB:
-    - checkout.session.completed -> attach stripe_sub_id to local sub (via metadata.subscription_local_id)
-    - invoice.payment_succeeded / failed -> mirror invoice and refresh subscription status
-    - customer.subscription.updated / deleted -> update status/periods/cancel flags
+      - checkout.session.completed -> attach Stripe subscription ID to our local subscription
+      - invoice.payment_succeeded / invoice.payment_failed -> mirror invoice and refresh local sub
+      - customer.subscription.updated / customer.subscription.deleted -> keep local status in sync
     """
     payload = await request.body()
-    if not stripe_signature:
+
+    # In real Stripe mode we require a signature. In fake mode we don't.
+    is_fake = provider.__class__.__name__ == "FakeStripeProvider"
+    if not is_fake and not stripe_signature:
         raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
 
-    event = provider.verify_signature(payload, stripe_signature)
-    event_id = event["id"]
-    event_type = event["type"]
-    obj = event["data"]["object"]
+    # Parse/verify event
+    event_obj = provider.verify_signature(payload, stripe_signature or "")
+    event = _to_dict(event_obj)
+    event_id: str = event.get("id")
+    event_type: str = event.get("type")
+    data_obj = _to_dict(event.get("data", {})).get("object")  # session / invoice / subscription etc.
+    obj = _to_dict(data_obj)
 
-    # dedupe by event id
-    project_id = None
-    md = obj.get("metadata") if isinstance(obj, dict) else None
-    if isinstance(md, dict):
-        project_id = md.get("project_id")
+    # Basic shape guard
+    if not event_id or not event_type or not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="Malformed webhook event")
+
+    # Record for idempotency/audit; ignore if duplicate
+    md = _to_dict(obj.get("metadata") or {})
+    project_id = _require(md, "project_id")
 
     e_repo = EventRepo(db)
-    is_new = await e_repo.record_if_new(
-        event_id=event_id,
-        project_id=project_id,
-        event_type=event_type,
-        payload=event,   # store full raw event
-    )
-    if not is_new:
+    if not await e_repo.record_if_new(event_id=event_id, project_id=project_id, event_type=event_type, payload=event):
         return {"ok": True, "deduped": True}
 
     s_repo = SubscriptionRepo(db)
     i_repo = InvoiceRepo(db)
 
-    # ---- Event handlers ----
+    # -------------------- handlers --------------------
+
     if event_type == "checkout.session.completed":
-        # Session contains subscription id and our metadata with local subscription id.
-        local_id = md.get("subscription_local_id") if isinstance(md, dict) else None
-        session_sub_id = obj.get("subscription")  # may be str
-        if local_id and session_sub_id:
-            # load local subscription
+        # Session should contain our metadata.subscription_local_id and a subscription id
+        local_id_str = _require(md, "subscription_local_id")
+        session_sub_id = obj.get("subscription")  # str when created
+
+        if local_id_str and session_sub_id:
             from uuid import UUID
-            sub = await s_repo.get(UUID(local_id))
-            if sub:
-                # pull full sub from Stripe for precise status/periods
-                remote = stripe.Subscription.retrieve(session_sub_id)
-                sub = await s_repo.update_from_stripe(
-                    sub,
-                    stripe_subscription_id=remote["id"],
-                    status=remote["status"],
-                    current_period_start=_utc(remote.get("current_period_start")),
-                    current_period_end=_utc(remote.get("current_period_end")),
-                    cancel_at_period_end=bool(remote.get("cancel_at_period_end")),
+            local_sub = await s_repo.get(UUID(local_id_str))
+            if local_sub:
+                # Use provider wrapper (works for real & fake)
+                remote = _to_dict(provider.retrieve_subscription(session_sub_id))
+                await s_repo.update_from_stripe(
+                    local_sub,
+                    stripe_subscription_id=remote.get("id"),
+                    status=remote.get("status"),
+                    current_period_start=_utc_from_epoch(remote.get("current_period_start")),
+                    current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
                 )
-        await db.commit()
+                await db.commit()
 
     elif event_type in ("invoice.payment_succeeded", "invoice.payment_failed"):
-        inv = obj  # Stripe invoice
-        # mirror invoice
-        proj = project_id or _project_from_invoice(inv)  # fallback derivation
+        # Mirror invoice
+        inv = obj  # already a dict
+        # project id: prefer explicit metadata; else derive via subscription/customer metadata
+        proj = project_id or await _project_from_invoice(inv, provider)
         if proj:
             await i_repo.upsert_from_stripe(project_id=proj, inv=inv)
-        # refresh the subscription from Stripe (authoritative)
+
+        # Refresh local subscription if we know its stripe id
         sub_id = inv.get("subscription")
         if sub_id:
-            remote = stripe.Subscription.retrieve(sub_id)
+            remote = _to_dict(provider.retrieve_subscription(sub_id))
             local = await s_repo.get_by_stripe_id(sub_id)
             if local:
                 await s_repo.update_from_stripe(
                     local,
-                    status=remote["status"],
-                    current_period_start=_utc(remote.get("current_period_start")),
-                    current_period_end=_utc(remote.get("current_period_end")),
-                    cancel_at_period_end=bool(remote.get("cancel_at_period_end")),
+                    status=remote.get("status"),
+                    current_period_start=_utc_from_epoch(remote.get("current_period_start")),
+                    current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
                 )
         await db.commit()
 
     elif event_type == "customer.subscription.updated":
-        remote = obj  # Stripe subscription
-        sub_id = remote["id"]
-        local = await s_repo.get_by_stripe_id(sub_id)
-        if local:
-            await s_repo.update_from_stripe(
-                local,
-                status=remote["status"],
-                current_period_start=_utc(remote.get("current_period_start")),
-                current_period_end=_utc(remote.get("current_period_end")),
-                cancel_at_period_end=bool(remote.get("cancel_at_period_end")),
-            )
-            await db.commit()
+        remote = obj
+        sub_id = remote.get("id")
+        if sub_id:
+            local = await s_repo.get_by_stripe_id(sub_id)
+            if local:
+                await s_repo.update_from_stripe(
+                    local,
+                    status=remote.get("status"),
+                    current_period_start=_utc_from_epoch(remote.get("current_period_start")),
+                    current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
+                )
+                await db.commit()
 
     elif event_type == "customer.subscription.deleted":
         remote = obj
-        sub_id = remote["id"]
-        local = await s_repo.get_by_stripe_id(sub_id)
-        if local:
-            await s_repo.update_from_stripe(local, status="canceled")
-            await db.commit()
+        sub_id = remote.get("id")
+        if sub_id:
+            local = await s_repo.get_by_stripe_id(sub_id)
+            if local:
+                await s_repo.update_from_stripe(local, status="canceled")
+                await db.commit()
 
-    # You can add dispute events etc. later
+    # no-op for other events (you can extend here)
     return {"ok": True, "type": event_type}
 
-def _project_from_invoice(inv: dict) -> Optional[str]:
+
+# -------------------- helpers for project inference --------------------
+
+async def _project_from_invoice(inv: Dict[str, Any], provider) -> Optional[str]:
     """
-    Best-effort project id extraction when metadata is missing.
-    We try subscription metadata, then customer metadata.
+    Best-effort project id extraction when invoice lacks explicit metadata.project_id
+    — try subscription.metadata then customer.metadata.
     """
+    # Try subscription
     try:
         sub_id = inv.get("subscription")
         if sub_id:
-            s = stripe.Subscription.retrieve(sub_id)
-            md = s.get("metadata") or {}
-            return md.get("project_id")
+            s = _to_dict(provider.retrieve_subscription(sub_id))
+            md = _to_dict(s.get("metadata") or {})
+            if "project_id" in md:
+                return md["project_id"]
     except Exception:
         pass
+
+    # Try customer
     try:
         cus_id = inv.get("customer")
         if cus_id:
-            c = stripe.Customer.retrieve(cus_id)
-            md = c.get("metadata") or {}
-            return md.get("project_id")
+            c = _to_dict(provider.retrieve_customer(cus_id))
+            md = _to_dict(c.get("metadata") or {})
+            if "project_id" in md:
+                return md["project_id"]
     except Exception:
         pass
+
     return None

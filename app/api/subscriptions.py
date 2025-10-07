@@ -1,17 +1,20 @@
+# app/api/subscriptions.py
+from __future__ import annotations
 from uuid import UUID
-from typing import Optional, List
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from typing import List
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.deps import get_db, get_stripe_provider
+from app.engine.engine import SubscriptionEngine, EngineError
 from app.schemas.api_models import (
     CreateSubscriptionRequest,
     SubscriptionResponse,
-    ChangePlanRequest,   # NEW
-    CancelRequest,       # NEW
-    ResumeRequest,       # NEW
+    ChangePlanRequest,
+    CancelRequest,
+    ResumeRequest,
 )
-from app.engine.engine import SubscriptionEngine, EngineError
-from app.engine.engine import SubscriptionEngine
 from app.persistence.repo import SubscriptionRepo
 
 router = APIRouter(prefix="/subscriptions", tags=["Subscriptions"])
@@ -23,16 +26,15 @@ async def create_subscription(
     stripe = Depends(get_stripe_provider),
     project_id: str = Header(..., alias="X-Project-Id"),
 ):
-    """
-    Create a subscription pinned to the latest config for this project.
-    Validates planCode. Persists a 'pending' subscription.
-    TODO: Wire Stripe to return checkoutUrl or stripeSubscriptionId.
-    """
     try:
         engine = SubscriptionEngine(db=db, stripe=stripe, project_id=project_id)
-        return await engine.create_subscription(body)
+        sub = await engine.create_subscription(body)
+
+        # If engine decided to go via checkout (according to config.payment.mode), it should
+        # put a URL on the returned view-model. If not present, keep None.
+        return sub
     except ValueError as e:
-        raise HTTPException(status_code=400, detail={"type":"validation_error","message":str(e)})
+        raise HTTPException(status_code=400, detail={"type": "validation_error", "message": str(e)})
 
 @router.get("/{subscription_id}", response_model=SubscriptionResponse)
 async def get_subscription(
@@ -43,6 +45,7 @@ async def get_subscription(
     sub = await SubscriptionRepo(db).get(subscription_id)
     if not sub or sub.project_id != project_id:
         raise HTTPException(status_code=404, detail={"type":"not_found","message":"Subscription not found"})
+    # Map ORM → API (same as your original, but leave checkoutUrl as stored if you keep it)
     return SubscriptionResponse(
         id=sub.id,
         projectId=sub.project_id,
@@ -56,12 +59,13 @@ async def get_subscription(
         currentPeriodStart=sub.current_period_start.isoformat() if sub.current_period_start else None,
         currentPeriodEnd=sub.current_period_end.isoformat() if sub.current_period_end else None,
         cancelAtPeriodEnd=sub.cancel_at_period_end,
-        checkoutUrl=None,
+        checkoutUrl=getattr(sub, "checkout_url", None),
+        metadata=sub.metadata or None if hasattr(sub, "metadata") else None,
     )
 
 @router.get("", response_model=List[SubscriptionResponse])
 async def list_subscriptions_for_account(
-    accountId: str,
+    accountId: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
     project_id: str = Header(..., alias="X-Project-Id"),
 ):
@@ -80,7 +84,8 @@ async def list_subscriptions_for_account(
             currentPeriodStart=s.current_period_start.isoformat() if s.current_period_start else None,
             currentPeriodEnd=s.current_period_end.isoformat() if s.current_period_end else None,
             cancelAtPeriodEnd=s.cancel_at_period_end,
-            checkoutUrl=None,
+            checkoutUrl=getattr(s, "checkout_url", None),
+            metadata=s.metadata or None if hasattr(s, "metadata") else None,
         )
         for s in subs
     ]
@@ -93,14 +98,9 @@ async def change_plan(
     stripe = Depends(get_stripe_provider),
     project_id: str = Header(..., alias="X-Project-Id"),
 ):
-    """
-    Change plan and/or quantity with proration control.
-    prorationBehavior: "create_prorations" | "none" | "always_invoice"
-    """
     sub = await SubscriptionRepo(db).get(subscription_id)
     if not sub or sub.project_id != project_id:
         raise HTTPException(status_code=404, detail={"type": "not_found", "message": "Subscription not found"})
-
     engine = SubscriptionEngine(db=db, stripe=stripe, project_id=project_id)
     try:
         return await engine.change_plan(
@@ -112,7 +112,6 @@ async def change_plan(
     except EngineError as e:
         raise HTTPException(status_code=400, detail={"type": "validation_error", "message": str(e)})
 
-
 @router.post("/{subscription_id}/cancel", response_model=SubscriptionResponse)
 async def cancel_subscription(
     subscription_id: UUID,
@@ -121,19 +120,14 @@ async def cancel_subscription(
     stripe = Depends(get_stripe_provider),
     project_id: str = Header(..., alias="X-Project-Id"),
 ):
-    """
-    Cancel immediately or at period end.
-    """
     sub = await SubscriptionRepo(db).get(subscription_id)
     if not sub or sub.project_id != project_id:
         raise HTTPException(status_code=404, detail={"type": "not_found", "message": "Subscription not found"})
-
     engine = SubscriptionEngine(db=db, stripe=stripe, project_id=project_id)
     try:
         return await engine.cancel(subscription=sub, at_period_end=bool(body.cancelAtPeriodEnd))
     except EngineError as e:
         raise HTTPException(status_code=400, detail={"type": "validation_error", "message": str(e)})
-
 
 @router.post("/{subscription_id}/resume", response_model=SubscriptionResponse)
 async def resume_subscription(
@@ -143,13 +137,9 @@ async def resume_subscription(
     stripe = Depends(get_stripe_provider),
     project_id: str = Header(..., alias="X-Project-Id"),
 ):
-    """
-    Resume a subscription that was set to cancel at period end.
-    """
     sub = await SubscriptionRepo(db).get(subscription_id)
     if not sub or sub.project_id != project_id:
         raise HTTPException(status_code=404, detail={"type": "not_found", "message": "Subscription not found"})
-
     engine = SubscriptionEngine(db=db, stripe=stripe, project_id=project_id)
     try:
         return await engine.resume(subscription=sub)

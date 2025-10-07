@@ -8,9 +8,9 @@ from app.engine.strategies.base import (
     MeteringStrategy,
     SeatStrategy,
 )
+from app.engine.strategies.entitlements import StaticEntitlement
 from app.engine.strategies.proration import LinearProration, NoProration, AlwaysInvoiceProration
 from app.engine.strategies.invoicing import AutoCharge, SendInvoice
-from app.engine.strategies.entitlement import StaticEntitlement
 from app.engine.strategies.metering import MonthlyWindow
 from app.engine.strategies.seats import PooledSeats
 
