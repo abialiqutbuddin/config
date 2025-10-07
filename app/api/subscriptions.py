@@ -60,7 +60,7 @@ async def get_subscription(
         currentPeriodEnd=sub.current_period_end.isoformat() if sub.current_period_end else None,
         cancelAtPeriodEnd=sub.cancel_at_period_end,
         checkoutUrl=getattr(sub, "checkout_url", None),
-        metadata=sub.metadata or None if hasattr(sub, "metadata") else None,
+        metadata=sub.meta or None,
     )
 
 @router.get("", response_model=List[SubscriptionResponse])
@@ -85,7 +85,7 @@ async def list_subscriptions_for_account(
             currentPeriodEnd=s.current_period_end.isoformat() if s.current_period_end else None,
             cancelAtPeriodEnd=s.cancel_at_period_end,
             checkoutUrl=getattr(s, "checkout_url", None),
-            metadata=s.metadata or None if hasattr(s, "metadata") else None,
+            metadata=s.meta or None,
         )
         for s in subs
     ]

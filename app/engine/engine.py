@@ -12,6 +12,7 @@ from app.persistence.models import Subscription
 from app.schemas.api_models import CreateSubscriptionRequest, SubscriptionResponse
 from app.payments.types import PaymentProvider  # interface for stripe/fake
 
+
 class EngineError(ValueError):
     pass
 
@@ -27,21 +28,22 @@ class SubscriptionEngine:
     async def _load_plan(self, plan_code: str) -> Tuple[UUID, dict]:
         """
         Load latest config for this project and return (config_version_id, plan_dict)
-        where plan is found by plans[i].code == plan_code.
+        where plan is found by config.json['plans'][plan_code].
         """
         cfg = await ConfigRepo(self.db).get_latest(self.project_id)
         if not cfg:
             raise EngineError("No config published for this project")
 
-        plans = (cfg.json or {}).get("plans", [])
-        if not isinstance(plans, list):
-            raise EngineError("Config is invalid: 'plans' must be an array")
+        plans = (cfg.json or {}).get("plans") or {}
+        if not isinstance(plans, dict):
+            # hard failure so the config is corrected (client schema says object)
+            raise EngineError("Config is invalid: 'plans' must be an object")
 
-        for p in plans:
-            if isinstance(p, dict) and p.get("code") == plan_code:
-                return cfg.id, p
+        plan = plans.get(plan_code)
+        if not isinstance(plan, dict):
+            raise EngineError(f"planCode '{plan_code}' not found")
 
-        raise EngineError(f"planCode '{plan_code}' not found")
+        return cfg.id, plan
 
     def _price_id_from_plan(self, plan: dict) -> str:
         billing = plan.get("billing") or {}
@@ -58,17 +60,23 @@ class SubscriptionEngine:
             raise EngineError("trialDays must be a non-negative integer")
         return td
 
-    def _decide_flow(self, request_checkout: Optional[bool]) -> str:
+    def _config_mode(self, cfg_json: dict) -> str:
         """
-        Schema no longer has payment.mode.
+        Respect client schema default:
+        - payment.mode: 'checkout' | 'direct'  (default to 'checkout' if missing)
+        """
+        return ((cfg_json or {}).get("payment") or {}).get("mode", "checkout")
+
+    def _decide_flow(self, request_checkout: Optional[bool], config_mode: str) -> str:
+        """
         - If request explicitly asks for checkout True/False, honor it.
-        - Otherwise default to 'checkout' (safe default for real payments).
+        - Else, use config default from payment.mode.
         """
         if request_checkout is True:
             return "checkout"
         if request_checkout is False:
             return "direct"
-        return "checkout"
+        return "checkout" if config_mode == "checkout" else "direct"
 
     # ---------------- Public operations ----------------
 
@@ -82,11 +90,11 @@ class SubscriptionEngine:
         if body.quantity is None or body.quantity < 1:
             raise EngineError("quantity must be >= 1")
 
-        # Resolve plan from latest config (array by code)
         cfg = await ConfigRepo(self.db).get_latest(self.project_id)
         if not cfg:
             raise EngineError("No config published for this project")
 
+        config_mode = self._config_mode(cfg.json)
         _, plan = await self._load_plan(body.planCode)
         price_id = self._price_id_from_plan(plan)
         trial_days = self._trial_days_from_plan(plan)
@@ -100,8 +108,8 @@ class SubscriptionEngine:
             metadata=(body.metadata or {}),
         )
 
-        # Decide flow (schema has no payment.mode anymore)
-        flow = self._decide_flow(body.checkout)
+        # Decide flow (request flag wins, else config default)
+        flow = self._decide_flow(body.checkout, config_mode)
 
         repo = SubscriptionRepo(self.db)
         sub = await repo.create(
@@ -127,8 +135,7 @@ class SubscriptionEngine:
         status: str = "pending"
 
         if flow == "checkout":
-            # Hosted Checkout — Stripe will create the subscription after payment.
-            # Webhook should promote local sub from pending -> active.
+            # Hosted Checkout — Stripe will create subscription after payment (webhook finalizes)
             success_url = "https://example.com/success?session_id={CHECKOUT_SESSION_ID}"
             cancel_url = "https://example.com/cancel"
             checkout_url, _session_id = self.stripe.create_checkout_session(
@@ -146,10 +153,6 @@ class SubscriptionEngine:
                 },
             )
             status = "pending"
-
-            # (Optional) persist checkout_url if you add a column:
-            # sub = await repo.update(sub, checkout_url=checkout_url)
-            # await self.db.commit()
 
         else:
             # Direct subscription — created immediately
@@ -195,7 +198,7 @@ class SubscriptionEngine:
             currentPeriodStart=_iso(current_period_start or sub.current_period_start),
             currentPeriodEnd=_iso(current_period_end or sub.current_period_end),
             cancelAtPeriodEnd=sub.cancel_at_period_end,
-            checkoutUrl=checkout_url,   # returned even if not persisted
+            checkoutUrl=checkout_url,
             metadata=sub.meta or {},
         )
 
@@ -293,6 +296,7 @@ def _from_epoch(ts: Optional[int]) -> Optional[datetime]:
     if ts is None:
         return None
     return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
     if not dt:
