@@ -74,16 +74,26 @@ async def usage_summary(
 ):
     """
     Returns aggregated usage totals for the window [start, end).
-    If start/end are not provided, derives them from the **latest** subscription's current period.
+    If start/end are not provided, derives them from the latest subscription's current period.
     """
-    # Window selection
-    window_start: Optional[datetime] = datetime.fromisoformat(start.replace("Z", "+00:00")) if start else None
-    window_end: Optional[datetime] = datetime.fromisoformat(end.replace("Z", "+00:00")) if end else None
-    if window_start and window_start.tzinfo is None: window_start = window_start.replace(tzinfo=timezone.utc)
-    if window_end and window_end.tzinfo is None: window_end = window_end.replace(tzinfo=timezone.utc)
 
+    def _parse_optional_iso(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=400, detail={"type": "validation_error", "message": "start/end must be ISO8601"})
+
+    # Parse provided bounds (if any)
+    window_start: Optional[datetime] = _parse_optional_iso(start)
+    window_end: Optional[datetime] = _parse_optional_iso(end)
+
+    # If missing, derive from latest subscription's current period
     if not window_start or not window_end:
-        # Use latest subscription for account to infer billing window
         srepo = SubscriptionRepo(db)
         subs = await srepo.list_for_account(project_id, accountId)
         active_like = [s for s in subs if s.status in ("trialing", "active", "past_due", "pending")]
@@ -91,14 +101,17 @@ async def usage_summary(
         if not sub or not sub.current_period_start or not sub.current_period_end:
             raise HTTPException(
                 status_code=400,
-                detail={"type":"missing_window","message":"Provide start/end or ensure subscription has current period"},
+                detail={"type": "missing_window", "message": "Provide start/end or ensure subscription has current period"},
             )
-        window_start = sub.current_period_start
-        window_end = sub.current_period_end
+        window_start = sub.current_period_start.astimezone(timezone.utc)
+        window_end = sub.current_period_end.astimezone(timezone.utc)
 
-    # Normalize to UTC
-    window_start = window_start.astimezone(timezone.utc)
-    window_end = window_end.astimezone(timezone.utc)
+    # Validate ordering
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=400,
+            detail={"type": "validation_error", "message": "start must be earlier than end"},
+        )
 
     # Aggregate
     urepo = UsageRepo(db)

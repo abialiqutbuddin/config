@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, conint
 class CreateSubscriptionRequest(BaseModel):
     accountId: str = Field(..., min_length=1)
     planCode: str = Field(..., min_length=1)
-    quantity: conint(ge=1) = 1
+    quantity: int = Field(1, ge=1)
     checkout: Optional[bool] = True                 # True => hosted Checkout; False => direct API
     coupon: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None       # arbitrary round-tripped to provider
@@ -36,7 +36,7 @@ class SubscriptionResponse(BaseModel):
 
 class ChangePlanRequest(BaseModel):
     planCode: str = Field(..., min_length=1)
-    quantity: conint(ge=1) = 1
+    quantity: int = Field(1, ge=1)
     prorationBehavior: Literal["create_prorations", "none", "always_invoice"] = "create_prorations"
 
 
