@@ -242,6 +242,7 @@ class SubscriptionEngine:
         current_period_start: Optional[datetime] = None
         current_period_end: Optional[datetime] = None
         status: str = "pending"
+        trial_end_at: Optional[datetime] = None
 
         if flow == "checkout":
             success_url = "https://example.com/success?session_id={CHECKOUT_SESSION_ID}"

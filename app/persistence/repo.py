@@ -206,7 +206,8 @@ class EventRepo:
             select(PaymentEvent.id)
             .where(
                 PaymentEvent.provider == provider,
-                PaymentEvent.payload["id"].astext == event_id,   # JSONB field
+                # payload->>'id' = :event_id   (works for json & jsonb)
+                PaymentEvent.payload.op("->>")("id") == event_id,
             )
             .limit(1)
         )
@@ -462,24 +463,27 @@ class IdempotencyRepo:
             status="in_progress",
             response=None,
         )
+        # Ensure the row is attached to this session
         self.db.add(row)
         await self.db.flush()
-        await self.db.refresh(row)
+        # no refresh() needed; PK is known (composite) and fields are already set
         return row
 
     async def mark_succeeded(self, row: IdempotencyKey, response_payload: dict) -> IdempotencyKey:
+        # defensively attach if detached
+        self.db.add(row)
         row.status = "succeeded"
         row.response = response_payload
         await self.db.flush()
-        await self.db.refresh(row)
         return row
 
     async def mark_failed(self, row: IdempotencyKey, response_payload: Optional[dict] = None) -> IdempotencyKey:
+        # defensively attach if detached
+        self.db.add(row)
         row.status = "failed"
         if response_payload is not None:
             row.response = response_payload
         await self.db.flush()
-        await self.db.refresh(row)
         return row
     
 

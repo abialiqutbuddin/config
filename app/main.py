@@ -15,6 +15,7 @@ from app.api import (
     invoices,
     stripe_webhooks,
     health,
+    entitlements
 )
 
 setup_logging()
@@ -44,6 +45,7 @@ app.include_router(usage.router)
 app.include_router(invoices.router)
 app.include_router(stripe_webhooks.router)
 app.include_router(health.router)
+app.include_router(entitlements.router) 
 
 # Paths that bypass auth (health, docs, and Stripe webhook)
 AUTH_EXEMPT_PREFIXES = (

@@ -18,8 +18,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
+from .base import Base
 
-Base = declarative_base()
 
 
 # -------------------------
@@ -69,8 +69,6 @@ class IdempotencyKey(Base):
 # -------------------------
 # Subscriptions
 # -------------------------
-Base = declarative_base()
-
 class Subscription(Base):
     __tablename__ = "subscriptions"
 
