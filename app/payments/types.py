@@ -8,6 +8,11 @@ class PaymentProvider(Protocol):
     def retrieve_subscription(self, subscription_id: str) -> Dict[str, Any]: ...
     def retrieve_customer(self, customer_id: str) -> Dict[str, Any]: ...
 
+    # --- price resolution (NEW) ---
+    def resolve_price_id(
+        self, *, currency: str, cadence: str, unit_price: float
+    ) -> str: ...
+
     # --- customers ---
     def ensure_customer(
         self, *, account_id: str, project_id: str, email: Optional[str], metadata: Dict[str, Any]
@@ -17,7 +22,8 @@ class PaymentProvider(Protocol):
     def create_checkout_session(
         self, *, customer_id: str, price_id: str, quantity: int,
         success_url: str, cancel_url: str, trial_days: Optional[int],
-        coupon: Optional[str], metadata: Dict[str, Any]
+        coupon: Optional[str], metadata: Dict[str, Any],
+        idempotency_key: Optional[str] = None,     
     ) -> Tuple[str, str]: ...
 
     # --- subscriptions ---
@@ -25,7 +31,8 @@ class PaymentProvider(Protocol):
         self, *, customer_id: str, price_id: str, quantity: int,
         trial_days: Optional[int], coupon: Optional[str],
         collection_method: str, proration_behavior: str,
-        metadata: Dict[str, Any]
+        metadata: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]: ...
 
     def update_subscription(

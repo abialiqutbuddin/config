@@ -1,6 +1,5 @@
-# app/engine/engine.py
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any, List
 from uuid import UUID
 from datetime import datetime, timezone
 
@@ -17,88 +16,196 @@ class EngineError(ValueError):
     pass
 
 
+def _from_epoch(ts: Optional[int]) -> Optional[datetime]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 class SubscriptionEngine:
+    """
+    Engine aligned to the schema:
+
+    {
+      "projectId": "...",
+      "currency": "USD",
+      "plans": [
+        { "code": "BASIC", "cadence": "monthly" | "annual", "price": 9.99,
+          "trial": { "days": 14 } | null,
+          "features": [...],
+          "strategies": {
+            "ProrationStrategy": "...",          # required
+            "InvoicingStrategy": "...",          # required
+            "EntitlementStrategy": "...",        # required
+            "MeteringStrategy": "...",           # optional
+            "SeatStrategy": "..."                # optional
+          }
+        }
+      ],
+      "billingAnchor": { "type": "anniversary" | "calendar" }?,
+      "timeZone": "..."?
+    }
+
+    Notes:
+    - We DO NOT expect a Stripe priceId in config.
+    - We resolve Stripe price via provider.resolve_price_id(currency, cadence, price).
+    """
+
     def __init__(self, db: AsyncSession, stripe: PaymentProvider, project_id: str):
         self.db = db
         self.stripe = stripe
         self.project_id = project_id
 
-    # ---------------- Core helpers ----------------
+    # ---------------- helpers for config/schema ----------------
 
-    async def _load_plan(self, plan_code: str) -> Tuple[UUID, dict]:
-        """
-        Load latest config for this project and return (config_version_id, plan_dict)
-        where plan is found by config.json['plans'][plan_code].
-        """
+    async def _load_config(self) -> dict:
         cfg = await ConfigRepo(self.db).get_latest(self.project_id)
         if not cfg:
             raise EngineError("No config published for this project")
+        if not isinstance(cfg.json, dict):
+            raise EngineError("Config JSON must be an object")
+        return cfg.json
 
-        plans = (cfg.json or {}).get("plans") or {}
-        if not isinstance(plans, dict):
-            # hard failure so the config is corrected (client schema says object)
-            raise EngineError("Config is invalid: 'plans' must be an object")
+    @staticmethod
+    def _extract_currency(cfg_json: dict) -> str:
+        cur = (cfg_json or {}).get("currency")
+        if not isinstance(cur, str) or len(cur) != 3:
+            raise EngineError("Config is invalid: 'currency' must be a 3-letter code")
+        return cur.upper()
 
-        plan = plans.get(plan_code)
-        if not isinstance(plan, dict):
+    @staticmethod
+    def _plans_array(cfg_json: dict) -> List[dict]:
+        plans = (cfg_json or {}).get("plans")
+        if not isinstance(plans, list) or not plans:
+            raise EngineError("Config is invalid: 'plans' must be a non-empty array")
+        return plans
+
+    @staticmethod
+    def _pick_cadence_hint(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        c = (metadata or {}).get("cadence")
+        if isinstance(c, str) and c in ("monthly", "annual"):
+            return c
+        return None
+
+    def _find_plan(self, plans: List[dict], *, plan_code: str, cadence_hint: Optional[str]) -> dict:
+        """
+        Find a plan by code (and cadence if provided). If multiple with same code:
+        - prefer cadence_hint if present
+        - else prefer 'monthly'
+        - else first match
+        """
+        matches = [p for p in plans if isinstance(p, dict) and p.get("code") == plan_code]
+        if not matches:
             raise EngineError(f"planCode '{plan_code}' not found")
 
-        return cfg.id, plan
+        if len(matches) == 1:
+            return matches[0]
 
-    def _price_id_from_plan(self, plan: dict) -> str:
-        billing = plan.get("billing") or {}
-        price_id = billing.get("priceId")
-        if not price_id:
-            raise EngineError("Plan is missing billing.priceId")
-        return price_id
+        if cadence_hint:
+            for p in matches:
+                if p.get("cadence") == cadence_hint:
+                    return p
+        for p in matches:
+            if p.get("cadence") == "monthly":
+                return p
+        return matches[0]
 
-    def _trial_days_from_plan(self, plan: dict) -> int:
-        td = plan.get("trialDays")
-        if td is None:
+    @staticmethod
+    def _extract_cadence(plan: dict) -> str:
+        cad = plan.get("cadence")
+        if cad not in ("monthly", "annual"):
+            raise EngineError("Plan is missing a valid 'cadence' (monthly|annual)")
+        return cad
+
+    @staticmethod
+    def _extract_price(plan: dict) -> float:
+        price = plan.get("price")
+        try:
+            price = float(price)
+        except Exception:
+            raise EngineError("Plan 'price' must be a number")
+        if price < 0:
+            raise EngineError("Plan 'price' cannot be negative")
+        return price
+
+    @staticmethod
+    def _trial_days(plan: dict) -> int:
+        t = plan.get("trial")
+        if t is None:
             return 0
-        if not isinstance(td, int) or td < 0:
-            raise EngineError("trialDays must be a non-negative integer")
-        return td
+        if not isinstance(t, dict):
+            raise EngineError("Plan 'trial' must be an object or null")
+        days = t.get("days", 0)
+        if not isinstance(days, int) or days < 0:
+            raise EngineError("trial.days must be a non-negative integer")
+        return days
 
-    def _config_mode(self, cfg_json: dict) -> str:
-        """
-        Respect client schema default:
-        - payment.mode: 'checkout' | 'direct'  (default to 'checkout' if missing)
-        """
-        return ((cfg_json or {}).get("payment") or {}).get("mode", "checkout")
+    @staticmethod
+    def _strategies(plan: dict) -> dict:
+        s = plan.get("strategies")
+        if not isinstance(s, dict):
+            raise EngineError("Plan 'strategies' must be an object")
+        return s
 
-    def _decide_flow(self, request_checkout: Optional[bool], config_mode: str) -> str:
+    @staticmethod
+    def _decide_flow(request_checkout: Optional[bool]) -> str:
         """
-        - If request explicitly asks for checkout True/False, honor it.
-        - Else, use config default from payment.mode.
+        Schema has no payment.mode now.
+        - checkout=True  -> checkout
+        - checkout=False -> direct
+        - None           -> checkout (safe default)
         """
         if request_checkout is True:
             return "checkout"
         if request_checkout is False:
             return "direct"
-        return "checkout" if config_mode == "checkout" else "direct"
+        return "checkout"
 
-    # ---------------- Public operations ----------------
+    # ---------------- public operations ----------------
 
-    async def create_subscription(self, body: CreateSubscriptionRequest) -> SubscriptionResponse:
+    async def create_subscription(self, body: CreateSubscriptionRequest, idempotency_key: Optional[str] = None) -> SubscriptionResponse:
         """
-        1) Validate plan and config
-        2) Ensure customer
-        3) Create hosted Checkout OR direct subscription
-        4) Persist local row
+        1) Validate & select plan from array (by code [+ cadence hint if present])
+        2) Resolve Stripe price_id from (currency, cadence, price)
+        3) Ensure customer
+        4) Create hosted Checkout OR direct subscription
+        5) Persist local row
         """
         if body.quantity is None or body.quantity < 1:
             raise EngineError("quantity must be >= 1")
 
-        cfg = await ConfigRepo(self.db).get_latest(self.project_id)
-        if not cfg:
-            raise EngineError("No config published for this project")
+        cfg_json = await self._load_config()
+        currency = self._extract_currency(cfg_json)
+        plans = self._plans_array(cfg_json)
 
-        config_mode = self._config_mode(cfg.json)
-        _, plan = await self._load_plan(body.planCode)
-        price_id = self._price_id_from_plan(plan)
-        trial_days = self._trial_days_from_plan(plan)
+        cadence_hint = self._pick_cadence_hint(body.metadata)
+        plan = self._find_plan(plans, plan_code=body.planCode, cadence_hint=cadence_hint)
+
+        cadence = self._extract_cadence(plan)
+        unit_price = self._extract_price(plan)
+        trial_days = self._trial_days(plan)
+
+        # --- NEW: enforce required strategy keys from schema ---
+        s = self._strategies(plan)
+        for req in ("ProrationStrategy", "InvoicingStrategy", "EntitlementStrategy"):
+            if req not in s or not isinstance(s[req], str) or not s[req]:
+                raise EngineError(f"Plan 'strategies.{req}' is required and must be a string")
+
+        # build strategies bundle (your strategy classes can still read plan details)
         bundle = build_bundle(plan)
+
+        # resolve Stripe price_id based on (currency, cadence, unit_price)
+        price_id = self.stripe.resolve_price_id(
+            currency=currency, cadence=cadence, unit_price=unit_price
+        )
 
         # Ensure customer
         customer_id = self.stripe.ensure_customer(
@@ -108,9 +215,9 @@ class SubscriptionEngine:
             metadata=(body.metadata or {}),
         )
 
-        # Decide flow (request flag wins, else config default)
-        flow = self._decide_flow(body.checkout, config_mode)
+        flow = self._decide_flow(body.checkout)
 
+        # Persist minimal local row first (pending)
         repo = SubscriptionRepo(self.db)
         sub = await repo.create(
             project_id=self.project_id,
@@ -118,13 +225,15 @@ class SubscriptionEngine:
             plan_code=body.planCode,
             quantity=body.quantity,
             status="pending",
-            config_version_id=cfg.id,
+            config_version_id=(await ConfigRepo(self.db).get_latest(self.project_id)).id,
             stripe_customer_id=customer_id,
             stripe_subscription_id=None,
             current_period_start=None,
             current_period_end=None,
             cancel_at_period_end=False,
             meta=(body.metadata or {}),
+            currency=currency,
+            unit_price=unit_price,
         )
         await self.db.commit()
 
@@ -135,7 +244,6 @@ class SubscriptionEngine:
         status: str = "pending"
 
         if flow == "checkout":
-            # Hosted Checkout — Stripe will create subscription after payment (webhook finalizes)
             success_url = "https://example.com/success?session_id={CHECKOUT_SESSION_ID}"
             cancel_url = "https://example.com/cancel"
             checkout_url, _session_id = self.stripe.create_checkout_session(
@@ -146,16 +254,28 @@ class SubscriptionEngine:
                 cancel_url=cancel_url,
                 trial_days=trial_days,
                 coupon=body.coupon,
+                idempotency_key=idempotency_key,
                 metadata={
                     "project_id": self.project_id,
                     "account_id": body.accountId,
                     "subscription_local_id": str(sub.id),
+                    "plan_code": body.planCode,
+                    "cadence": cadence,
+                    "currency": currency,
+                    "unit_price": unit_price,
                 },
             )
             status = "pending"
 
+            # Optional persistence of checkout_url if your model has the column.
+            try:
+                sub = await repo.update(sub, checkout_url=checkout_url)
+                await self.db.commit()
+            except TypeError:
+                # repo.update does not accept checkout_url → ignore silently
+                pass
+
         else:
-            # Direct subscription — created immediately
             created = self.stripe.create_subscription(
                 customer_id=customer_id,
                 price_id=price_id,
@@ -164,16 +284,22 @@ class SubscriptionEngine:
                 coupon=body.coupon,
                 collection_method=bundle.invoicing.collection_method(),
                 proration_behavior=bundle.proration.proration_behavior(),
+                idempotency_key=idempotency_key,
                 metadata={
                     "project_id": self.project_id,
                     "account_id": body.accountId,
                     "subscription_local_id": str(sub.id),
+                    "plan_code": body.planCode,
+                    "cadence": cadence,
+                    "currency": currency,
+                    "unit_price": unit_price,
                 },
             )
             stripe_sub_id = created["id"]
             status = created["status"]
             current_period_start = _from_epoch(created.get("current_period_start"))
             current_period_end = _from_epoch(created.get("current_period_end"))
+            trial_end_at = _from_epoch(created.get("trial_end"))
 
             sub = await repo.update(
                 sub,
@@ -181,6 +307,7 @@ class SubscriptionEngine:
                 status=status,
                 current_period_start=current_period_start,
                 current_period_end=current_period_end,
+                trial_end_at=trial_end_at,
             )
             await self.db.commit()
 
@@ -192,13 +319,14 @@ class SubscriptionEngine:
             planCode=sub.plan_code,
             quantity=sub.quantity,
             status=status,
-            configVersionId=cfg.id,
+            configVersionId=sub.config_version_id,
             stripeCustomerId=sub.stripe_customer_id,
             stripeSubscriptionId=stripe_sub_id or sub.stripe_subscription_id,
             currentPeriodStart=_iso(current_period_start or sub.current_period_start),
             currentPeriodEnd=_iso(current_period_end or sub.current_period_end),
+            trialEndAt=_iso(trial_end_at or sub.trial_end_at),
             cancelAtPeriodEnd=sub.cancel_at_period_end,
-            checkoutUrl=checkout_url,
+            checkoutUrl=checkout_url if flow == "checkout" else getattr(sub, "checkout_url", None),
             metadata=sub.meta or {},
         )
 
@@ -213,8 +341,27 @@ class SubscriptionEngine:
         if quantity < 1:
             raise EngineError("quantity must be >= 1")
 
-        config_version_id, plan = await self._load_plan(new_plan_code)
-        price_id = self._price_id_from_plan(plan)
+        cfg_json = await self._load_config()
+        currency = self._extract_currency(cfg_json)
+        plans = self._plans_array(cfg_json)
+
+        cadence_hint = None
+        if isinstance(subscription.meta, dict):
+            h = subscription.meta.get("cadence")
+            if isinstance(h, str) and h in ("monthly", "annual"):
+                cadence_hint = h
+
+        plan = self._find_plan(plans, plan_code=new_plan_code, cadence_hint=cadence_hint)
+        cadence = self._extract_cadence(plan)
+        unit_price = self._extract_price(plan)
+
+        # validate strategies here too (defensive)
+        s = self._strategies(plan)
+        for req in ("ProrationStrategy", "InvoicingStrategy", "EntitlementStrategy"):
+            if req not in s or not isinstance(s[req], str) or not s[req]:
+                raise EngineError(f"Plan 'strategies.{req}' is required and must be a string")
+
+        price_id = self.stripe.resolve_price_id(currency=currency, cadence=cadence, unit_price=unit_price)
         bundle = build_bundle(plan)
 
         if not subscription.stripe_subscription_id:
@@ -235,7 +382,8 @@ class SubscriptionEngine:
             status=updated["status"],
             current_period_start=_from_epoch(updated.get("current_period_start")),
             current_period_end=_from_epoch(updated.get("current_period_end")),
-            config_version_id=config_version_id,
+            currency=currency,
+            unit_price=unit_price,
         )
         await self.db.commit()
         return self._dto(subscription)
@@ -271,7 +419,7 @@ class SubscriptionEngine:
         await self.db.commit()
         return self._dto(subscription)
 
-    # ---------------- Formatting helpers ----------------
+    # ---------------- DTO ----------------
 
     def _dto(self, sub: Subscription) -> SubscriptionResponse:
         return SubscriptionResponse(
@@ -286,21 +434,8 @@ class SubscriptionEngine:
             stripeSubscriptionId=sub.stripe_subscription_id,
             currentPeriodStart=_iso(sub.current_period_start),
             currentPeriodEnd=_iso(sub.current_period_end),
+            trialEndAt=_iso(sub.trial_end_at),                   # <-- NEW
             cancelAtPeriodEnd=sub.cancel_at_period_end,
             checkoutUrl=getattr(sub, "checkout_url", None),
             metadata=sub.meta or {},
         )
-
-
-def _from_epoch(ts: Optional[int]) -> Optional[datetime]:
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc)
-
-
-def _iso(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()

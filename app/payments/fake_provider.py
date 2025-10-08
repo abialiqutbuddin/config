@@ -1,84 +1,68 @@
-# app/payments/fake_provider.py
 from __future__ import annotations
-
 from typing import Tuple, Optional, Dict, Any
 import json
-import time
+from datetime import datetime, timezone
+
+_INTERVAL_MAP = {"monthly": "month", "annual": "year"}
 
 
 class FakeStripeProvider:
     """
-    In-memory fake Stripe provider for local/dev use.
-
-    Mirrors the public surface of StripePaymentProvider so the rest of the app
-    can swap providers without code changes.
-
-    - Customers are keyed by account_id (stable per project/account).
-    - Subscriptions are keyed by subscription_id (e.g., "sub_test_1").
-    - Webhook 'verification' is a no-op: we just json.loads(payload).
-    - Time fields use epoch seconds to match Stripe's shape.
+    In-memory, protocol-compliant fake for tests/local runs.
+    Matches app.payments.types.PaymentProvider signatures.
     """
 
     def __init__(self):
-        # account_id -> {"id": "cus_test_1", "metadata": {...}}
+        # account_id -> {id, metadata}
         self.customers: Dict[str, Dict[str, Any]] = {}
-        # subscription_id -> subscription dict
+        # sub_id -> dict (Stripe-like shape where needed)
         self.subscriptions: Dict[str, Dict[str, Any]] = {}
-        # simple counters
-        self._next_customer = 1
-        self._next_subscription = 1
-        self._next_session = 1
+        # key(currency:cadence:amount) -> price_id
+        self._prices: Dict[str, str] = {}
 
-    # ---------------------------------------------------------------------
-    # Core / webhooks
-    # ---------------------------------------------------------------------
+    # ------- helpers -------
+    def _price_key(self, *, currency: str, cadence: str, unit_price: float) -> str:
+        return f"{currency.upper()}:{cadence}:{unit_price:.2f}"
+
+    # --- resolve price id from currency/cadence/amount ---
+    def resolve_price_id(self, *, currency: str, cadence: str, unit_price: float) -> str:
+        key = self._price_key(currency=currency, cadence=cadence, unit_price=unit_price)
+        pid = self._prices.get(key)
+        if not pid:
+            pid = f"price_fake_{len(self._prices)+1}"
+            self._prices[key] = pid
+        return pid
+
+    # --- webhooks/signature ---
     def verify_signature(self, payload: bytes, sig_header: str):
         """
-        Fake mode: no signature verification. Just parse and return JSON.
+        In fake, no signature check. Accept raw JSON payloads.
         """
         if isinstance(payload, (bytes, bytearray)):
             payload = payload.decode("utf-8")
         return json.loads(payload)
 
-    def retrieve_subscription(self, subscription_id: str) -> Dict[str, Any]:
-        """
-        Return a normalized dict for a subscription. If it's missing (e.g. app
-        restarted), synthesize a minimal 'active' record so dev flows keep going.
-        """
-        return self._ensure_sub(subscription_id)
-
-    def retrieve_customer(self, customer_id: str) -> Dict[str, Any]:
-        """
-        Scan the small in-memory store and return a normalized dict.
-        """
-        for entry in self.customers.values():
-            if entry["id"] == customer_id:
-                return {"id": customer_id, "metadata": dict(entry.get("metadata") or {})}
-        return {"id": customer_id, "metadata": {}}
-
-    # ---------------------------------------------------------------------
-    # Customers
-    # ---------------------------------------------------------------------
+    # --- customers ---
     def ensure_customer(
         self, *, account_id: str, project_id: str, email: Optional[str], metadata: Dict[str, Any]
     ) -> str:
-        """
-        Ensure a single customer per (project/account). We key by account_id for dev.
-        """
-        existing = self.customers.get(account_id)
-        if existing:
-            return existing["id"]
-        cid = f"cus_test_{self._next_customer}"
-        self._next_customer += 1
+        entry = self.customers.get(account_id)
+        if entry:
+            return entry["id"]
+        cid = f"cus_test_{len(self.customers)+1}"
         self.customers[account_id] = {
             "id": cid,
             "metadata": {"project_id": project_id, "account_id": account_id, **(metadata or {})},
         }
         return cid
 
-    # ---------------------------------------------------------------------
-    # Checkout
-    # ---------------------------------------------------------------------
+    def retrieve_customer(self, customer_id: str) -> dict:
+        for entry in self.customers.values():
+            if entry["id"] == customer_id:
+                return {"id": customer_id, "metadata": entry.get("metadata", {})}
+        return {"id": customer_id, "metadata": {}}
+
+    # --- checkout ---
     def create_checkout_session(
         self,
         *,
@@ -92,17 +76,12 @@ class FakeStripeProvider:
         metadata: Dict[str, Any],
     ) -> Tuple[str, str]:
         """
-        Return a fake hosted URL and a fake session id. The webhook flow in dev
-        will typically be simulated by hitting /stripe/webhook manually.
+        Just return a stable fake URL & a fake session id. No state is kept;
+        real subscription will be stitched via a subsequent fake webhook.
         """
-        sid = f"cs_test_{self._next_session}"
-        self._next_session += 1
-        # We don't store sessions; only need to emulate the shape for callers.
-        return "https://checkout.local/success", sid
+        return ("https://checkout.local/success", f"cs_test_{len(self.subscriptions)+1}")
 
-    # ---------------------------------------------------------------------
-    # Subscriptions
-    # ---------------------------------------------------------------------
+    # --- subscriptions ---
     def create_subscription(
         self,
         *,
@@ -114,66 +93,55 @@ class FakeStripeProvider:
         collection_method: str,
         proration_behavior: str,
         metadata: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Create a subscription immediately (no hosted checkout).
-        """
-        sub_id = f"sub_test_{self._next_subscription}"
-        self._next_subscription += 1
-
-        now = int(time.time())
-        # 30-day 'period' window for dev purposes
-        start = now
-        end = now + 30 * 24 * 3600
-
-        status = "trialing" if (trial_days or 0) > 0 else "active"
-        record = {
-            "id": sub_id,
+    ) -> dict:
+        sid = f"sub_test_{len(self.subscriptions)+1}"
+        # Fixed example period (30d). You can compute from now() if you prefer.
+        now = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp())
+        plus_30d = now + 30 * 24 * 3600
+        sub = {
+            "id": sid,
             "customer": customer_id,
-            "status": status,
-            "current_period_start": start,
-            "current_period_end": end,
+            "status": "active" if not trial_days or trial_days == 0 else "trialing",
+            "current_period_start": now,
+            "current_period_end": plus_30d,
             "cancel_at_period_end": False,
-            "collection_method": collection_method,          # "charge_automatically" | "send_invoice"
-            "proration_behavior": proration_behavior,        # "create_prorations" | "none" | "always_invoice"
-            "metadata": dict(metadata or {}),
-            "items": {
-                "data": [
-                    {"id": f"si_{sub_id}_1", "price": price_id, "quantity": int(quantity)},
-                ]
-            },
+            "collection_method": collection_method,
+            "proration_behavior": proration_behavior,
+            "metadata": metadata or {},
+            "items": {"data": [{"id": f"si_{sid}_1", "price": price_id, "quantity": quantity}]},
         }
-        self.subscriptions[sub_id] = record
-        return self._normalize(record)
+        self.subscriptions[sid] = sub
+        return sub
 
     def update_subscription(
-        self,
-        *,
-        subscription_id: str,
-        price_id: str,
-        quantity: int,
-        proration_behavior: str,
-    ) -> Dict[str, Any]:
-        """
-        Update price/quantity and proration behavior.
-        """
-        sub = self._ensure_sub(subscription_id)
-        # keep first item shape like Stripe single-price subs
-        if "items" not in sub:
-            sub["items"] = {"data": [{"id": f"si_{subscription_id}_1", "price": price_id, "quantity": int(quantity)}]}
-        else:
-            if not sub["items"].get("data"):
-                sub["items"]["data"] = [{"id": f"si_{subscription_id}_1", "price": price_id, "quantity": int(quantity)}]
-            else:
-                sub["items"]["data"][0].update({"price": price_id, "quantity": int(quantity)})
-        sub["proration_behavior"] = proration_behavior
-        return self._normalize(sub)
+        self, *, subscription_id: str, price_id: str, quantity: int, proration_behavior: str
+    ) -> dict:
+        sub = self.subscriptions.get(subscription_id)
+        if not sub:
+            # create a placeholder so change-plan on unknown id doesn't 500 in fake mode
+            now = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp())
+            plus_30d = now + 30 * 24 * 3600
+            sub = {
+                "id": subscription_id,
+                "customer": "cus_fake",
+                "status": "active",
+                "current_period_start": now,
+                "current_period_end": plus_30d,
+                "cancel_at_period_end": False,
+                "items": {"data": [{"id": f"si_{subscription_id}_1", "price": price_id, "quantity": quantity}]},
+                "metadata": {},
+            }
+            self.subscriptions[subscription_id] = sub
 
-    def cancel_subscription(self, *, subscription_id: str, at_period_end: bool) -> Dict[str, Any]:
-        """
-        Cancel immediately or schedule cancellation at period end.
-        """
-        sub = self._ensure_sub(subscription_id)
+        sub["items"]["data"][0].update({"price": price_id, "quantity": quantity})
+        sub["proration_behavior"] = proration_behavior
+        return sub
+
+    def cancel_subscription(self, *, subscription_id: str, at_period_end: bool) -> dict:
+        sub = self.subscriptions.get(subscription_id)
+        if not sub:
+            sub = {"id": subscription_id, "status": "canceled", "cancel_at_period_end": False}
+            self.subscriptions[subscription_id] = sub
         if at_period_end:
             sub["cancel_at_period_end"] = True
         else:
@@ -182,65 +150,33 @@ class FakeStripeProvider:
         return {
             "id": sub["id"],
             "status": sub["status"],
-            "cancel_at_period_end": bool(sub.get("cancel_at_period_end", False)),
-            "customer": sub.get("customer"),
+            "cancel_at_period_end": sub["cancel_at_period_end"],
         }
 
-    def resume_subscription(self, *, subscription_id: str) -> Dict[str, Any]:
-        """
-        Clear cancel_at_period_end; mark active.
-        """
-        sub = self._ensure_sub(subscription_id)
+    def resume_subscription(self, *, subscription_id: str) -> dict:
+        sub = self.subscriptions.get(subscription_id)
+        if not sub:
+            sub = {"id": subscription_id, "status": "active", "cancel_at_period_end": False}
+            self.subscriptions[subscription_id] = sub
         sub["status"] = "active"
         sub["cancel_at_period_end"] = False
         return {
             "id": sub["id"],
             "status": sub["status"],
-            "cancel_at_period_end": bool(sub.get("cancel_at_period_end", False)),
-            "customer": sub.get("customer"),
+            "cancel_at_period_end": sub["cancel_at_period_end"],
         }
 
-    # ---------------------------------------------------------------------
-    # Internals (dev convenience)
-    # ---------------------------------------------------------------------
-    def _ensure_sub(self, subscription_id: str) -> Dict[str, Any]:
-        """
-        Dev-friendly guard: if a subscription ID isn't known (e.g. server restarted
-        between create and change-plan), synthesize a minimal active record to
-        avoid KeyError during local testing.
-        """
+    def retrieve_subscription(self, subscription_id: str) -> dict:
         sub = self.subscriptions.get(subscription_id)
-        if sub:
-            return sub
-
-        now = int(time.time())
-        sub = {
-            "id": subscription_id,
-            "customer": None,
-            "status": "active",
-            "current_period_start": now,
-            "current_period_end": now + 30 * 24 * 3600,
-            "cancel_at_period_end": False,
-            "collection_method": "charge_automatically",
-            "proration_behavior": "create_prorations",
-            "metadata": {},
-            "items": {"data": [{"id": f"si_{subscription_id}_1", "price": "price_dev", "quantity": 1}]},
-        }
-        self.subscriptions[subscription_id] = sub
+        if not sub:
+            now = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp())
+            plus_30d = now + 30 * 24 * 3600
+            return {
+                "id": subscription_id,
+                "status": "active",
+                "current_period_start": now,
+                "current_period_end": plus_30d,
+                "cancel_at_period_end": False,
+                "metadata": {},
+            }
         return sub
-
-    @staticmethod
-    def _normalize(sub: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Return a normalized subset used by the engine/webhooks to mirror the
-        StripePaymentProvider return shape.
-        """
-        return {
-            "id": sub["id"],
-            "status": sub.get("status", "active"),
-            "current_period_start": int(sub.get("current_period_start")) if sub.get("current_period_start") else None,
-            "current_period_end": int(sub.get("current_period_end")) if sub.get("current_period_end") else None,
-            "cancel_at_period_end": bool(sub.get("cancel_at_period_end", False)),
-            "customer": sub.get("customer"),
-            "metadata": dict(sub.get("metadata") or {}),
-        }

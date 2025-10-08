@@ -1,63 +1,102 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Billing Config",
   "type": "object",
-  "required": ["payment", "plans"],
+  "required": [
+    "projectId",
+    "currency",
+    "plans"
+  ],
   "properties": {
-    "label": { "type": "string", "minLength": 1 },
-    "payment": {
+    "projectId": {
+      "type": "string"
+    },
+    "currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "timeZone": {
+      "type": "string"
+    },
+    "billingAnchor": {
       "type": "object",
-      "required": ["mode"],
       "properties": {
-        "mode": { "type": "string", "enum": ["checkout", "direct"] }
+        "type": {
+          "enum": [
+            "anniversary",
+            "calendar"
+          ]
+        }
       },
-      "additionalProperties": false
+      "required": [
+        "type"
+      ]
     },
     "plans": {
-      "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {
+      "type": "array",
+      "items": {
         "type": "object",
-        "required": ["billing"],
+        "required": [
+          "code",
+          "cadence",
+          "price",
+          "strategies"
+        ],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
-          "billing": {
-            "type": "object",
-            "required": ["priceId"],
-            "properties": {
-              "priceId": { "type": "string", "minLength": 1 },
-              "cadence": { "type": "string", "enum": ["month", "year"] },
-              "currency": { "type": "string", "minLength": 3, "maxLength": 3 }
-            },
-            "additionalProperties": false
+          "code": {
+            "type": "string"
           },
-          "trialDays": { "type": "integer", "minimum": 0, "default": 0 },
-          "strategies": {
-            "type": "object",
+          "cadence": {
+            "enum": [
+              "monthly",
+              "annual"
+            ]
+          },
+          "price": {
+            "type": "number",
+            "minimum": 0
+          },
+          "trial": {
+            "type": [
+              "object",
+              "null"
+            ],
             "properties": {
-              "ProrationStrategy": { "type": "string", "enum": ["linear", "none", "always_invoice"] },
-              "InvoicingStrategy": { "type": "string", "enum": ["charge-automatically", "send_invoice", "auto"] },
-              "EntitlementStrategy": { "type": "string", "enum": ["static"] },
-              "MeteringStrategy": { "type": "string", "enum": ["monthly-window"] },
-              "SeatStrategy": { "type": "string", "enum": ["pooled-seats"] }
-            },
-            "additionalProperties": false
+              "days": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
           },
           "features": {
+            "type": "array"
+          },
+          "strategies": {
             "type": "object",
+            "required": [
+              "ProrationStrategy",
+              "InvoicingStrategy",
+              "EntitlementStrategy"
+            ],
             "properties": {
-              "seats": { "type": "integer", "minimum": 0 },
-              "limits": {
-                "type": "object",
-                "additionalProperties": { "type": "number", "minimum": 0 }
+              "ProrationStrategy": {
+                "type": "string"
+              },
+              "InvoicingStrategy": {
+                "type": "string"
+              },
+              "EntitlementStrategy": {
+                "type": "string"
+              },
+              "MeteringStrategy": {
+                "type": "string"
+              },
+              "SeatStrategy": {
+                "type": "string"
               }
-            },
-            "additionalProperties": true
+            }
           }
-        },
-        "additionalProperties": true
+        }
       }
     }
-  },
-  "additionalProperties": false
+  }
 }

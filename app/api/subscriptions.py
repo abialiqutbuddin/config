@@ -1,11 +1,12 @@
 # app/api/subscriptions.py
 from __future__ import annotations
 from uuid import UUID
-from typing import List
+from typing import List, Optional
+import hashlib, json 
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from app.persistence.repo import SubscriptionRepo, IdempotencyRepo
 from app.core.deps import get_db, get_stripe_provider
 from app.engine.engine import SubscriptionEngine, EngineError
 from app.schemas.api_models import (
@@ -25,16 +26,45 @@ async def create_subscription(
     db: AsyncSession = Depends(get_db),
     stripe = Depends(get_stripe_provider),
     project_id: str = Header(..., alias="X-Project-Id"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    # ---- Idempotency gate (required by your LLD) ----
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail={"type": "missing_header", "message": "Idempotency-Key required"})
+
+    def _stable_request_hash(payload: dict) -> str:
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    idem_repo = IdempotencyRepo(db)
+    req_hash = _stable_request_hash(body.model_dump(mode="json"))
+
+    existing = await idem_repo.get(project_id=project_id, key=idempotency_key)
+    if existing:
+        if existing.status == "succeeded" and existing.response:
+            return SubscriptionResponse(**existing.response)
+        if existing.status == "in_progress":
+            raise HTTPException(status_code=409, detail={"type": "in_progress", "message": "Request is being processed"})
+        # if failed -> continue to retry
+
+    row = await idem_repo.create_in_progress(project_id=project_id, key=idempotency_key, request_hash=req_hash)
+
     try:
         engine = SubscriptionEngine(db=db, stripe=stripe, project_id=project_id)
-        sub = await engine.create_subscription(body)
-
-        # If engine decided to go via checkout (according to config.payment.mode), it should
-        # put a URL on the returned view-model. If not present, keep None.
+        sub = await engine.create_subscription(body, idempotency_key=idempotency_key)  # pass key down
+        await idem_repo.mark_succeeded(row, response_payload=sub.model_dump(mode="json"))
+        await db.commit()
         return sub
-    except ValueError as e:
+
+    except EngineError as e:
+        await idem_repo.mark_failed(row, response_payload={"type": "validation_error", "message": str(e)})
+        await db.commit()
         raise HTTPException(status_code=400, detail={"type": "validation_error", "message": str(e)})
+
+    except Exception as e:
+        await idem_repo.mark_failed(row, response_payload={"type": "error", "message": str(e)})
+        await db.commit()
+        raise
 
 @router.get("/{subscription_id}", response_model=SubscriptionResponse)
 async def get_subscription(
@@ -58,6 +88,7 @@ async def get_subscription(
         stripeSubscriptionId=sub.stripe_subscription_id,
         currentPeriodStart=sub.current_period_start.isoformat() if sub.current_period_start else None,
         currentPeriodEnd=sub.current_period_end.isoformat() if sub.current_period_end else None,
+        trialEndAt=sub.trial_end_at.isoformat() if sub.trial_end_at else None,
         cancelAtPeriodEnd=sub.cancel_at_period_end,
         checkoutUrl=getattr(sub, "checkout_url", None),
         metadata=sub.meta or None,
@@ -83,6 +114,7 @@ async def list_subscriptions_for_account(
             stripeSubscriptionId=s.stripe_subscription_id,
             currentPeriodStart=s.current_period_start.isoformat() if s.current_period_start else None,
             currentPeriodEnd=s.current_period_end.isoformat() if s.current_period_end else None,
+            trialEndAt=s.trial_end_at.isoformat() if s.trial_end_at else None,      # <-- NEW
             cancelAtPeriodEnd=s.cancel_at_period_end,
             checkoutUrl=getattr(s, "checkout_url", None),
             metadata=s.meta or None,

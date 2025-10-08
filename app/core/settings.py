@@ -33,8 +33,8 @@ class Settings(BaseSettings):
 
     # --- Payments ---
     PAYMENTS_BACKEND: Literal["fake", "stripe"] = "fake"
-    STRIPE_SECRET_KEY: str = ""         # required if PAYMENTS_BACKEND=stripe
-    STRIPE_WEBHOOK_SECRET: str = ""     # required if PAYMENTS_BACKEND=stripe
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
 
     model_config = ConfigDict(env_file=".env", case_sensitive=False)
 

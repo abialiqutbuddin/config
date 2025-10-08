@@ -29,6 +29,7 @@ class SubscriptionResponse(BaseModel):
     stripeSubscriptionId: Optional[str] = None
     currentPeriodStart: Optional[str] = None  # ISO8601 or None
     currentPeriodEnd: Optional[str] = None    # ISO8601 or None
+    trialEndAt: Optional[str] = None
     cancelAtPeriodEnd: bool = False
     checkoutUrl: Optional[str] = None         # populated on checkout flow
     metadata: Optional[Dict[str, Any]] = None
@@ -104,6 +105,35 @@ class InvoiceListItem(BaseModel):
     createdAt: Optional[str] = None
 
 
-class InvoiceDetail(InvoiceListItem):
-    # Extend with line items later if you mirror them.
-    pass
+# ---------- Invoice Lines ----------
+class InvoiceLineItem(BaseModel):
+    id: UUID
+    lineType: str
+    featureKey: Optional[str] = None
+    quantity: float
+    unitPrice: float
+    amount: float
+
+class InvoiceDetail(BaseModel):
+    id: UUID
+    projectId: str
+    stripeInvoiceId: str
+    stripeCustomerId: Optional[str] = None
+    stripeSubscriptionId: Optional[str] = None
+    status: str
+    currency: Optional[str] = None
+    subtotal: Optional[float] = None
+    total: Optional[float] = None
+    hostedInvoiceUrl: Optional[str] = None
+    periodStart: Optional[str] = None
+    periodEnd: Optional[str] = None
+    createdAt: Optional[str] = None
+    # NEW
+    lines: List[InvoiceLineItem] = []
+
+# ---------- Entitlements Cache ----------
+class EntitlementsCacheResponse(BaseModel):
+    projectId: str
+    accountId: str
+    asOf: str
+    payload: Dict[str, Any]

@@ -81,9 +81,21 @@ async def webhook(
     # Record for idempotency/audit; ignore if duplicate
     md = _to_dict(obj.get("metadata") or {})
     project_id = _require(md, "project_id")
+    if not project_id:
+     project_id = await _infer_project_id_for_event(event_type, obj, provider)
+    if not project_id:
+        # As a last resort (schema requires NOT NULL), you can reject or bucket into a sentinel.
+        # Opting to reject to avoid bad data.
+        raise HTTPException(status_code=400, detail="project_id missing and could not be inferred")
 
     e_repo = EventRepo(db)
-    if not await e_repo.record_if_new(event_id=event_id, project_id=project_id, event_type=event_type, payload=event):
+    if not await e_repo.record_if_new(
+        provider="stripe",
+        event_id=event_id,
+        project_id=project_id,
+        event_type=event_type,
+        payload=event,
+    ):
         return {"ok": True, "deduped": True}
 
     s_repo = SubscriptionRepo(db)
@@ -108,6 +120,7 @@ async def webhook(
                     status=remote.get("status"),
                     current_period_start=_utc_from_epoch(remote.get("current_period_start")),
                     current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    trial_end_at=_utc_from_epoch(remote.get("trial_end")),         
                     cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
                 )
                 await db.commit()
@@ -131,6 +144,7 @@ async def webhook(
                     status=remote.get("status"),
                     current_period_start=_utc_from_epoch(remote.get("current_period_start")),
                     current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    trial_end_at=_utc_from_epoch(remote.get("trial_end")),   
                     cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
                 )
         await db.commit()
@@ -146,6 +160,7 @@ async def webhook(
                     status=remote.get("status"),
                     current_period_start=_utc_from_epoch(remote.get("current_period_start")),
                     current_period_end=_utc_from_epoch(remote.get("current_period_end")),
+                    trial_end_at=_utc_from_epoch(remote.get("trial_end")),            # ← add this
                     cancel_at_period_end=bool(remote.get("cancel_at_period_end", False)),
                 )
                 await db.commit()
@@ -191,5 +206,57 @@ async def _project_from_invoice(inv: Dict[str, Any], provider) -> Optional[str]:
                 return md["project_id"]
     except Exception:
         pass
+
+    return None
+
+async def _infer_project_id_for_event(event_type: str, obj: Dict[str, Any], provider) -> Optional[str]:
+    """
+    Try to infer project_id when metadata.project_id is absent:
+      - invoice.*: use existing _project_from_invoice()
+      - customer.subscription.*: look at obj.metadata or fetch subscription/customer
+      - checkout.session.completed: obj.subscription -> fetch subscription.metadata
+    """
+    md = _to_dict(obj.get("metadata") or {})
+    if "project_id" in md:
+        return md["project_id"]
+
+    # invoice.*
+    if event_type.startswith("invoice."):
+        return await _project_from_invoice(obj, provider)
+
+    # customer.subscription.*
+    if event_type.startswith("customer.subscription."):
+        sub_id = obj.get("id")
+        try:
+            s = _to_dict(provider.retrieve_subscription(sub_id)) if sub_id else {}
+            md2 = _to_dict(s.get("metadata") or {})
+            if "project_id" in md2:
+                return md2["project_id"]
+            # fallback via customer
+            cus_id = s.get("customer")
+            if cus_id:
+                c = _to_dict(provider.retrieve_customer(cus_id))
+                md3 = _to_dict(c.get("metadata") or {})
+                if "project_id" in md3:
+                    return md3["project_id"]
+        except Exception:
+            pass
+
+    # checkout.session.completed
+    if event_type == "checkout.session.completed":
+        sub_id = obj.get("subscription")
+        try:
+            s = _to_dict(provider.retrieve_subscription(sub_id)) if sub_id else {}
+            md2 = _to_dict(s.get("metadata") or {})
+            if "project_id" in md2:
+                return md2["project_id"]
+            cus_id = s.get("customer")
+            if cus_id:
+                c = _to_dict(provider.retrieve_customer(cus_id))
+                md3 = _to_dict(c.get("metadata") or {})
+                if "project_id" in md3:
+                    return md3["project_id"]
+        except Exception:
+            pass
 
     return None
